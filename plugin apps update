@@ -1,0 +1,209 @@
+# Manus — Checklist
+- Vercel: connect repo, set env vars (Claude & ElevenLabs).
+- (Optional) Supabase auth to protect /admin (can add later).
+- Keep media non-downloadable; certificates downloadable.
+- (Optional) Store /api/log-completion payloads in DB for audits.
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>EASYCE — Player</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Poppins:wght@600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+<style>
+  body { background: #0B0C10; color: #F5F7FA; font-family: Inter, system-ui, sans-serif; }
+  .card { background: rgba(28,29,34,0.9); border: 1px solid rgba(58,59,69,0.4); border-radius: 18px; box-shadow: 0 10px 30px rgba(0,0,0,.22); }
+  .btn { background: #D4AF37; color: #0B0C10; border-radius: 12px; padding: 10px 16px; font-weight: 700; }
+  .btn-outline { border: 1px solid rgba(245,247,250,0.2); border-radius: 12px; padding: 10px 16px; }
+  .disabled { opacity: .5; pointer-events: none; }
+</style>
+</head>
+<body>
+<div class="max-w-5xl mx-auto px-4 py-8">
+  <header class="flex items-center justify-between mb-6">
+    <div class="flex items-center gap-3">
+      <img src="/assets/easyce-logo.png" alt="EASYCE" style="height:38px;border-radius:8px;border:1px solid rgba(58,59,69,.5)">
+      <div>
+        <div class="font-[Poppins] font-semibold tracking-wide">EASYCE.CA</div>
+        <div id="headerMeta" class="text-xs text-white/60"></div>
+      </div>
+    </div>
+    <div class="text-sm text-white/70">Seat-time: <span id="seatTime">0:00</span> / <span id="seatTarget">--:--</span></div>
+  </header>
+
+  <main id="app"></main>
+
+  <footer class="mt-10 text-xs text-white/50">
+    © <span id="y"></span> EASYCE.CA • Alberta
+  </footer>
+</div>
+
+<script>
+const qs = new URLSearchParams(location.search);
+const COURSE_ID = qs.get('courseId') || 'EC-AB-001';
+async function fetchText(path){ const r=await fetch(path); if(!r.ok) throw new Error(path); return r.text(); }
+function parseFrontMatter(md){
+  const m = md.match(/^---[\s\S]*?---/); let meta={ duration_minutes:60, ce_hours:1, province:'AB', title:'' }, body=md;
+  if(m){ const yaml=m[0].replace(/^---|---$/g,''); yaml.split(/\n/).forEach(line=>{ const i=line.indexOf(':'); if(i>0){ const k=line.slice(0,i).trim(); const v=line.slice(i+1).trim(); meta[k]=isNaN(v)?v.replace(/^"|"$|^'|'$/g,''):Number(v);} }); body=md.slice(m[0].length).trim(); }
+  return {meta, body};
+}
+function toSlides(b){ const parts=b.split(/\n\s*#\s*Slide:/).map((p,i)=>i===0?p:'Slide:'+p).filter(Boolean); const slides=[];
+  parts.forEach(p=>{ const lines=p.split(/\n/); let title=lines[0].replace(/^Slide:\s*/,'').trim(); let narration=''; let body=[]; let sec='body';
+    for(let i=1;i<lines.length;i++){ const L=lines[i]; if(/^Narration:/i.test(L)){sec='n';continue;} if(sec==='n'){ narration+=L+'\n'; } else { body.push(L); } }
+    slides.push({ title, body: body.join('\n').trim(), narration: narration.trim() });
+  }); return slides; }
+function mmss(s){ const m=Math.floor(s/60), x=s%60; return `${m}:${String(x).padStart(2,'0')}`; }
+
+let COURSE=null, QUIZ=null, idx=0, completed=new Set(), total=0, t=null, audio=null;
+function tick(){ total++; document.getElementById('seatTime').textContent=mmss(total);
+  const target=(COURSE.meta.duration_minutes||60)*60; const all=completed.size>=COURSE.slides.length;
+  if(total>=target && all){ const b=document.getElementById('quizBtn'); if(b) b.classList.remove('disabled'); } }
+function startTimer(){ if(!t){ t=setInterval(tick,1000);} }
+function stopTimer(){ if(t){ clearInterval(t); t=null;} }
+async function speakAndAdvance(text){
+  try{
+    const r=await fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+    const buf=await r.arrayBuffer(); if(audio){ audio.pause(); audio=null; }
+    audio=new Audio(URL.createObjectURL(new Blob([buf],{type:'audio/mpeg'})));
+    audio.addEventListener('ended',()=>{ if(idx<COURSE.slides.length-1){ idx++; renderSlide(true);} });
+    audio.play(); startTimer();
+  }catch(e){ const u=new SpeechSynthesisUtterance(text); u.onend=()=>{ if(idx<COURSE.slides.length-1){ idx++; renderSlide(true);} }; speechSynthesis.cancel(); speechSynthesis.speak(u); startTimer(); }
+}
+function stopNarration(){ try{ if(audio){ audio.pause(); } speechSynthesis.cancel(); }catch{} }
+
+async function loadCourse(){ const md=await fetchText(`content/courses/${COURSE_ID}/course.md`); const {meta, body}=parseFrontMatter(md);
+  COURSE={id:COURSE_ID, meta, slides:toSlides(body)}; document.getElementById('headerMeta').textContent=`${COURSE_ID} • ${meta.ce_hours} CE Hour • ${meta.province}`;
+  document.getElementById('seatTarget').textContent=mmss((meta.duration_minutes||60)*60); }
+function parseYaml(y){ const out={pass_mark:75, randomize:true, questions:[]}; const L=y.split(/\n/); let i=0;
+  while(i<L.length){ const l=L[i].trim(); if(l.startsWith('pass_mark:')) out.pass_mark=Number(l.split(':')[1].trim());
+    else if(l.startsWith('randomize:')) out.randomize=/true/i.test(l.split(':')[1]);
+    else if(l.startsWith('- id:')){ const q={id:l.split(':')[1].trim(), options:[]}; i++;
+      while(i<L.length && !L[i].trim().startsWith('- id:')){ const s=L[i].trim();
+        if(s.startsWith('type:')) q.type=s.split(':')[1].trim();
+        else if(s.startsWith('text:')) q.text=s.split(':').slice(1).join(':').trim().replace(/^"|"$|^'|'$/g,'');
+        else if(s.startsWith('- ')) q.options.push(s.slice(2).trim().replace(/^"|"$|^'|'$/g,''));
+        else if(s.startsWith('answer:')) q.answer=s.split(':').slice(1).join(':').trim().replace(/^"|"$|^'|'$/g,'');
+        i++; continue; } out.questions.push(q); continue; } i++; } return out; }
+async function loadQuiz(){ const b=`content/courses/${COURSE_ID}/quiz`; try{ QUIZ=JSON.parse(await fetchText(`${b}.json`)); }catch{ QUIZ=parseYaml(await fetchText(`${b}.yaml`)); } }
+
+function renderSlide(auto=false){
+  const s=COURSE.slides[idx]; completed.add(idx);
+  const app=document.getElementById('app'); app.innerHTML='';
+  const card=document.createElement('section'); card.className='card p-6'; card.innerHTML=`
+    <h1 class="text-2xl md:text-3xl font-[Poppins] font-semibold">${s.title}</h1>
+    <p class="mt-3 text-white/80 whitespace-pre-wrap">${s.body}</p>
+    <div class="mt-4 p-4 rounded-lg bg-black/30 border border-white/10">
+      <div class="text-xs uppercase tracking-wide text-white/60 mb-1">Narration</div>
+      <p class="text-white/80">${s.narration}</p>
+      <div class="mt-3 flex gap-3">
+        <button class="btn" id="playBtn">Play narration</button>
+        <button class="btn-outline" id="pauseBtn">Pause</button>
+        <button class="btn-outline" id="autoBtn">Play all (auto-advance)</button>
+      </div>
+    </div>
+    <div class="mt-6 flex justify-between items-center">
+      <button class="btn-outline" id="prevBtn">← Prev</button>
+      <div class="text-white/60 text-sm">Slide ${idx+1} of ${COURSE.slides.length}</div>
+      <button class="btn-outline" id="nextBtn">Next →</button>
+    </div>
+    <div class="mt-4 flex justify-end">
+      <button id="quizBtn" class="btn disabled" title="Complete all slides + seat-time">Take Quiz →</button>
+    </div>`;
+  app.appendChild(card);
+  document.getElementById('playBtn').onclick=()=>speakAndAdvance(s.narration);
+  document.getElementById('pauseBtn').onclick=()=>stopNarration();
+  document.getElementById('prevBtn').onclick=()=>{ stopNarration(); idx=Math.max(0,idx-1); renderSlide(); };
+  document.getElementById('nextBtn').onclick=()=>{ stopNarration(); idx=Math.min(COURSE.slides.length-1,idx+1); renderSlide(); };
+  document.getElementById('autoBtn').onclick=async()=>{ stopNarration(); for(let i=idx;i<COURSE.slides.length;i++){ idx=i; renderSlide(); await speakAndAdvance(COURSE.slides[i].narration);} };
+  const target=(COURSE.meta.duration_minutes||60)*60; const all=completed.size>=COURSE.slides.length;
+  if(total>=target && all){ document.getElementById('quizBtn').classList.remove('disabled'); }
+  document.getElementById('quizBtn').onclick=()=>{ if(!(total>=target && all)) return; renderQuiz(); };
+}
+
+function renderQuiz(){
+  const app=document.getElementById('app'); app.innerHTML='';
+  const card=document.createElement('section'); card.className='card p-6'; card.innerHTML=`<h2 class="text-2xl md:text-3xl font-[Poppins] font-semibold">Knowledge Check</h2>
+    <p class="mt-2 text-white/80">Pass mark: ${QUIZ.pass_mark||75}%</p>`; app.appendChild(card);
+  const form=document.createElement('form'); form.className='mt-4 space-y-6';
+  (QUIZ.questions||[]).forEach((q,i)=>{ const block=document.createElement('div'); block.className='p-4 rounded-lg bg-black/30 border border-white/10';
+    const label=document.createElement('div'); label.className='text-sm text-white/70'; label.textContent=`Q${i+1}. ${q.text}`; block.appendChild(label);
+    if(q.type==='mc'){ (q.options||[]).forEach(opt=>{ const l=document.createElement('label'); l.className='flex items-center gap-2 mt-2 cursor-pointer'; l.innerHTML=`<input type="radio" name="q${i}" value="${opt}"><span>${opt}</span>`; block.appendChild(l); }); }
+    else { ['True','False'].forEach(v=>{ const l=document.createElement('label'); l.className='flex items-center gap-2 mt-2 cursor-pointer'; l.innerHTML=`<input type="radio" name="q${i}" value="${v.toLowerCase()}"><span>${v}</span>`; block.appendChild(l); }); }
+    form.appendChild(block); });
+  const learner=document.createElement('div'); learner.className='card p-4 mt-4'; learner.innerHTML=`<div class="text-sm text-white/80 mb-2">Learner details (for certificate)</div>
+    <div class="grid md:grid-cols-3 gap-3"><input id="learnerName" placeholder="Full name" class="px-3 py-2 rounded-md bg-black/30 border border-white/10">
+    <input id="learnerLicense" placeholder="AIC License #" class="px-3 py-2 rounded-md bg-black/30 border border-white/10">
+    <input id="learnerEmail" placeholder="Email" class="px-3 py-2 rounded-md bg-black/30 border border-white/10"></div>`;
+  const submit=document.createElement('div'); submit.className='mt-4 flex justify-end gap-3'; submit.innerHTML='<button type="button" class="btn-outline" id="backBtn">← Back</button><button type="submit" class="btn" id="submitBtn">Submit Quiz</button>';
+  app.appendChild(form); app.appendChild(learner); app.appendChild(submit);
+  document.getElementById('backBtn').onclick=renderSlide;
+  form.onsubmit=async(e)=>{
+    e.preventDefault(); let correct=0;
+    (QUIZ.questions||[]).forEach((q,i)=>{
+      const val=(form.querySelector(`input[name="q${i}"]:checked`)||{}).value;
+      if(q.type==='mc' && val===q.answer) correct++;
+      if(q.type==='tf' && ((val==='true')===q.answer)) correct++;
+    });
+    const score=Math.round((correct/((QUIZ.questions||[]).length||1))*100);
+    const pass=score>=(QUIZ.pass_mark||75);
+    const name=document.getElementById('learnerName').value.trim();
+    const lic=document.getElementById('learnerLicense').value.trim();
+    const email=document.getElementById('learnerEmail').value.trim();
+    const result=document.createElement('div'); result.className='mt-4 card p-4';
+    result.innerHTML=`<div class="${pass?'text-green-300':'text-red-300'}">${pass?'Passed':'Not passed'}: ${score}%</div>
+      <div class="text-white/70 mt-1">Correct ${correct} of ${(QUIZ.questions||[]).length}</div>`; app.appendChild(result);
+    if(pass && name && lic && email){
+      const b=document.createElement('button'); b.className='btn mt-3'; b.textContent='Download Certificate PDF'; result.appendChild(b);
+      b.onclick=async()=>{ await logCompletion({name,lic,email,score}); await generateCertificate({name,lic,email,score}); };
+    } else if(pass){
+      const warn=document.createElement('div'); warn.className='text-yellow-300 mt-3'; warn.textContent='Enter full name, license #, and email to generate certificate.';
+      result.appendChild(warn);
+    }
+  };
+}
+async function logCompletion(payload){ try{ const body={...payload, course_id:COURSE_ID, course_title:COURSE.meta.title, ce_hours:COURSE.meta.ce_hours, province:COURSE.meta.province, seat_time_seconds:total, completed_at:new Date().toISOString()}; await fetch('/api/log-completion',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}catch{} }
+async function generateCertificate({name, lic, email, score}){
+  const { PDFDocument, StandardFonts, rgb } = PDFLib;
+  const existingPdfBytes = await fetch('./assets/aic_certificate_template.pdf').then(r=>r.arrayBuffer());
+  const pdfDoc = await PDFDocument.load(existingPdfBytes);
+  const page = pdfDoc.getPages()[0];
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const now=new Date(); const y=now.getFullYear(); const m=String(now.getMonth()+1).padStart(2,'0'); const d=String(now.getDate()).padStart(2,'0'); const dateStr=`${y}-${m}-${d}`;
+  const certId=`${COURSE_ID}-${Date.now().toString(36).toUpperCase()}`;
+  const draw=(text,x,y,size=12,bold=false)=>page.drawText(String(text||''),{x,y,size,font:bold?fontBold:font,color:rgb(0,0,0)});
+  draw('EASYCE.CA — Certificate of Completion',180,700,16,true);
+  draw('Course Title:',80,650,12,true); draw(`${COURSE.meta.title} (${COURSE_ID})`,170,650,12);
+  draw('Learner Name:',80,620,12,true); draw(name,170,620,12);
+  draw('AIC License #:',80,590,12,true); draw(lic,170,590,12);
+  draw('Email:',80,560,12,true); draw(email,170,560,12);
+  draw('CE Hours:',80,530,12,true); draw(`${COURSE.meta.ce_hours} (${COURSE.meta.province})`,170,530,12);
+  draw('Completion Date:',80,500,12,true); draw(dateStr,170,500,12);
+  draw('Score:',80,470,12,true); draw(score+'%',170,470,12);
+  draw('Certificate ID:',80,440,12,true); draw(certId,170,440,12);
+  const pdfBytes=await pdfDoc.save(); const blob=new Blob([pdfBytes],{type:'application/pdf'}); const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=`Certificate_${certId}.pdf`; a.click(); URL.revokeObjectURL(url);
+}
+
+async function init(){ document.getElementById('y').textContent=new Date().getFullYear(); await loadCourse(); try{ await loadQuiz(); }catch(e){ alert('Quiz not found'); }
+  const app=document.getElementById('app'); app.innerHTML=''; const intro=document.createElement('section'); intro.className='card p-6';
+  intro.innerHTML=`<h1 class="text-2xl md:text-3xl font-[Poppins] font-semibold">${COURSE.meta.title||'Course'}</h1>
+  <p class="mt-2 text-white/80">Seat-time: ${COURSE.meta.duration_minutes||60} minutes. Pass: 75%. Pause/resume allowed. No media downloads.</p>
+  <div class="mt-4 flex gap-3"><button class="btn" id="beginBtn">Begin Course</button><button class="btn-outline" id="previewBtn">Preview Slides</button></div>`;
+  app.appendChild(intro); document.getElementById('beginBtn').onclick=()=>{ startTimer(); renderSlide(); }; document.getElementById('previewBtn').onclick=()=>renderSlide(); }
+init();
+</script>
+</body>
+</html>
+
+# EASYCE Patch (Now)
+1) Merge contents into repo root.
+2) Vercel env vars: ANTHROPIC_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, (optional) COMPLETION_WEBHOOK_URL.
+3) /admin/index.html → Draft with Claude → download course.md + quiz.yaml → add under content/courses/<COURSE_ID>/.
+4) /slides/index.html?courseId=<COURSE_ID> (print to PDF if needed).
+5) /player.html?courseId=<COURSE_ID> → narration auto-advance → 60m seat-time → 75% pass → certificate.
